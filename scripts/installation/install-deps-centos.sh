@@ -59,6 +59,7 @@ install_base_packages() {
         tar \
         xz \
         git \
+        jq \
         ca-certificates \
         wget \
         iproute \

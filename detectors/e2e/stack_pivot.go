@@ -65,6 +65,12 @@ func (d *E2eStackPivot) OnEvent(ctx context.Context, event *v1beta1.Event) ([]de
 		processName = event.Workload.Process.Thread.Name
 	}
 
+	// The VMA_LOOKUP regression intentionally pivots to the heap while executing
+	// anonymous code. Its own detector checks both events from that invocation.
+	if processName == "vma_both" {
+		return nil, nil
+	}
+
 	// Make sure this is the exact event we're looking for
 	if processName == "stack_pivot" && syscall == "exit_group" && vmaType == "heap" {
 		// Make sure there was no false positive

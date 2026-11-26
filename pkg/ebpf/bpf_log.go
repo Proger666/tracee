@@ -33,7 +33,8 @@ const (
 	BPFLogIDHidKerMod
 
 	// find vma not supported
-	BPFLogIDFindVMAUnsupported // BPF_LOG_FIND_VMA_UNSUPPORTED
+	BPFLogIDFindVMAUnsupported     // BPF_LOG_FIND_VMA_UNSUPPORTED
+	BPFLogIDThreadStackUnavailable // BPF_LOG_THREAD_STACK_UNAVAILABLE
 )
 
 var stringMap = map[BPFLogType]string{
@@ -54,7 +55,8 @@ var stringMap = map[BPFLogType]string{
 	BPFLogIDHidKerMod: "BPF_LOG_ID_HID_KER_MOD",
 
 	// find vma not supported
-	BPFLogIDFindVMAUnsupported: "BPF_LOG_FIND_VMA_UNSUPPORTED",
+	BPFLogIDFindVMAUnsupported:     "BPF_LOG_FIND_VMA_UNSUPPORTED",
+	BPFLogIDThreadStackUnavailable: "BPF_LOG_THREAD_STACK_UNAVAILABLE",
 }
 
 var errorMap = map[BPFLogType]string{
@@ -75,7 +77,8 @@ var errorMap = map[BPFLogType]string{
 	BPFLogIDHidKerMod: "Failure in hidden kernel module seeker logic",
 
 	// find vma not supported
-	BPFLogIDFindVMAUnsupported: "Finding VMAs is not supported in this kernel",
+	BPFLogIDFindVMAUnsupported:     "Finding VMAs is not supported in this kernel",
+	BPFLogIDThreadStackUnavailable: "Thread stack tracking unavailable after the pre-userspace VMA retry",
 }
 
 func (b BPFLogType) String() string {

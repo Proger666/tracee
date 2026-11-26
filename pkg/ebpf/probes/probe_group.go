@@ -178,6 +178,40 @@ func (p *ProbeGroup) Autoload(handle Handle, autoload bool) error {
 	return p.probes[handle].autoload(p.module, autoload)
 }
 
+// SelectProgram chooses a tracing program variant before loading and attaching
+// probes. It preserves the hook, type, and compatibility requirements. The
+// caller must validate any additional requirements of the selected variant and
+// configure autoload for both variants before loading the BPF object.
+func (p *ProbeGroup) SelectProgram(handle Handle, programName string) error {
+	p.probesLock.Lock()
+	defer p.probesLock.Unlock()
+
+	if programName == "" {
+		return errfmt.Errorf("program name must not be empty")
+	}
+	probe, ok := p.probes[handle].(*TraceProbe)
+	if !ok || probe == nil {
+		return errfmt.Errorf("probe handle (%d) is not a tracing probe", handle)
+	}
+	if probe.attached {
+		return errfmt.Errorf("cannot change program for attached probe (%d)", handle)
+	}
+	if p.module != nil {
+		program, err := p.module.GetProgram(probe.programName)
+		if err != nil {
+			return errfmt.WrapError(err)
+		}
+		if program.FileDescriptor() >= 0 {
+			return errfmt.Errorf("cannot change program for loaded probe (%d)", handle)
+		}
+		if _, err := p.module.GetProgram(programName); err != nil {
+			return errfmt.WrapError(err)
+		}
+	}
+	probe.programName = programName
+	return nil
+}
+
 func (p *ProbeGroup) GetProbeByHandle(handle Handle) Probe {
 	return p.probes[handle]
 }

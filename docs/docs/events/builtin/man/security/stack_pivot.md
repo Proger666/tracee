@@ -44,10 +44,16 @@ This event detects stack pivoting by checking the stack pointer at selected sysc
 
 ## DEPENDENCIES
 
+**Syscall Monitoring:**
+
+- On kernels 6.1 and newer with the required helpers and confirmed BPF JIT support, one raw `sys_enter` tracepoint checks the configured syscall selection maps and uses `bpf_find_vma`.
+- The legacy backend uses individual syscall kprobes and requires the kernel's VMA red-black tree. Maple Tree lookup is only available through the helper backend.
+
 **Thread Tracking:**
 
 - sched_process_fork (optional) - Used for thread stack tracking
 - sched_process_exec (optional) - Used for thread stack tracking
+- schedule_tail (helper backend) - Makes one recovery attempt after a busy fork lookup, before the new thread executes userspace
 
 ## USE CASES
 
@@ -63,6 +69,9 @@ The kernel manages the stack for each process's main thread, but additional thre
 
 Limitations:
 
+- Backend selection is fixed at startup. Helper availability alone does not guarantee that the kernel verifier accepts the full program.
+- A busy memory-map lock or failed lookup produces no detection for that lookup. A failed lookup while tracking a new thread clears the inherited stack range to avoid false positives.
+- The helper backend retries an `EBUSY` fork lookup once at the new thread's first scheduling hook. A second failure leaves the stack untracked and reports `BPF_LOG_THREAD_STACK_UNAVAILABLE`; persistent contention and IRQ-disabled PREEMPT_RT contexts are not recovered by this retry.
 - Threads created before Tracee starts are not tracked
 - For untracked threads, anonymous memory regions are ignored to avoid false positives
 - This may result in false negatives for legitimate thread stacks created before Tracee started

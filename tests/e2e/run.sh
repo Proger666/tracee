@@ -326,7 +326,8 @@ done
 # ==============================================================================
 # Compute Timing Parameters
 # ==============================================================================
-# Computed after PHASE 1 (setup) so skip flags are already set.
+# Computed after PHASE 1 (setup) so most skip flags are already set. VMA backend
+# skips can only be resolved after startup and may conservatively extend this wait.
 # Core and extended tests track their own max values independently.
 
 core_max_test_timeout=0
@@ -409,6 +410,7 @@ last_status=$?
 if [[ ${last_status} -ne 0 ]]; then
     die "tracee startup failed"
 fi
+core_update_vma_test_support "${logfile}"
 print_test_separator
 
 # ==============================================================================
@@ -458,15 +460,18 @@ done
 # ==============================================================================
 print_test_header "WAITING FOR TESTS TO COMPLETE"
 info "Waiting for all tests to complete (max timeout: ${max_test_timeout}s)..."
+declare -A test_exit_status_map
 
 for test_name in "${!test_pids_map[@]}"; do
     pid="${test_pids_map[$test_name]}"
     test_output_file="/tmp/test_${test_name,,}_$$"
 
     if wait "$pid"; then
+        test_exit_status_map["${test_name}"]=0
         info "Test ${test_name} completed successfully"
     else
         exit_status=$?
+        test_exit_status_map["${test_name}"]="${exit_status}"
         info "Test ${test_name} failed with exit status ${exit_status}"
     fi
 
@@ -594,7 +599,9 @@ for TEST in ${INSTTESTS_CORE}; do
         continue
     fi
 
-    if core_test_check "${TEST}" "${outputfile}" "${logfile}"; then
+    if ! core_check_fixture_exit "${TEST}" "${test_exit_status_map[${TEST}]:-0}"; then
+        found=0
+    elif core_test_check "${TEST}" "${outputfile}" "${logfile}"; then
         found=1
     else
         found=0

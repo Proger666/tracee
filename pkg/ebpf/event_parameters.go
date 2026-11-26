@@ -68,6 +68,35 @@ type syscallInfo struct {
 	name string
 }
 
+// This handle is local to the syscall_checkers group. Legacy syscall handles
+// are nonnegative; the modern backend attaches one raw tracepoint for all
+// selected syscalls and both checker events.
+const syscallCheckerRawTracepointHandle probes.Handle = -1
+
+type syscallCheckerProbePlan struct {
+	handle      probes.Handle
+	probeType   probes.ProbeType
+	eventName   string
+	programName string
+}
+
+func planSyscallCheckerProbe(backend vmaLookupBackend, syscall syscallInfo) syscallCheckerProbePlan {
+	if backend == vmaLookupHelper {
+		return syscallCheckerProbePlan{
+			handle:      syscallCheckerRawTracepointHandle,
+			probeType:   probes.RawTracepoint,
+			eventName:   "raw_syscalls:sys_enter",
+			programName: backend.syscallCheckerProgram(),
+		}
+	}
+	return syscallCheckerProbePlan{
+		handle:      probes.Handle(syscall.id),
+		probeType:   probes.SyscallEnter,
+		eventName:   syscall.name,
+		programName: backend.syscallCheckerProgram(),
+	}
+}
+
 func getSyscallsFromParams(eventParams []map[string]filters.Filter[*filters.StringFilter], syscallArgName string) ([]syscallInfo, error) {
 	syscalls := []syscallInfo{}
 
@@ -125,14 +154,18 @@ func registerSyscallChecker(t *Tracee, eventParams []map[string]filters.Filter[*
 	}
 
 	for _, syscall := range syscalls {
-		// Register and attach a probe for this syscall, if not registered already
-		handle := probes.Handle(syscall.id)
-		if !probeGroup.HandleExists(handle) {
-			probe := probes.NewTraceProbe(probes.SyscallEnter, syscall.name, "syscall_checker")
-			if err := probeGroup.AddProbe(handle, probe); err != nil {
+		// Modern checks share one raw syscall entry tracepoint. Legacy checks
+		// retain individual syscall kprobes.
+		plan := planSyscallCheckerProbe(t.vmaLookupBackend, syscall)
+		if !probeGroup.HandleExists(plan.handle) {
+			probe := probes.NewTraceProbe(plan.probeType, plan.eventName, plan.programName)
+			if err := probeGroup.AddProbe(plan.handle, probe); err != nil {
 				return errfmt.WrapError(err)
 			}
-			if err := probeGroup.Attach(handle, t.getKernelSymbols()); err != nil {
+			if err := probeGroup.Attach(plan.handle, t.getKernelSymbols()); err != nil {
+				if t.vmaLookupBackend == vmaLookupHelper {
+					return fmt.Errorf("attach VMA syscall entry tracepoint: %w", err)
+				}
 				// Report attachment errors but don't fail, because it may be a syscall that doesn't exist on this system
 				logger.Warnw("Failed to attach syscall checker kprobe", "syscall", syscall.name, "error", err)
 				continue

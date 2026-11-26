@@ -55,11 +55,24 @@ Size of the memory region containing the stack pointer
 \f[B]vma_flags\f[R] (\f[I]uint64\f[R])
 Memory region flags (decoded if \f[CR]decoded\-data\f[R] is enabled)
 .SS DEPENDENCIES
+\f[B]Syscall Monitoring:\f[R]
+.IP \[bu] 2
+On kernels 6.1 and newer with the required helpers and confirmed BPF JIT
+support, one raw \f[CR]sys_enter\f[R] tracepoint checks the configured
+syscall selection maps and uses \f[CR]bpf_find_vma\f[R].
+.IP \[bu] 2
+The legacy backend uses individual syscall kprobes and requires the
+kernel\[cq]s VMA red\-black tree.
+Maple Tree lookup is only available through the helper backend.
+.PP
 \f[B]Thread Tracking:\f[R]
 .IP \[bu] 2
 sched_process_fork (optional) \- Used for thread stack tracking
 .IP \[bu] 2
 sched_process_exec (optional) \- Used for thread stack tracking
+.IP \[bu] 2
+schedule_tail (helper backend) \- Makes one recovery attempt after a
+busy fork lookup, before the new thread executes userspace
 .SS USE CASES
 .IP \[bu] 2
 \f[B]Exploit detection\f[R]: Detect ROP exploits that use the stack
@@ -77,6 +90,21 @@ thread stacks by storing the memory region pointed to by the stack
 pointer when new threads are created.
 .PP
 Limitations:
+.IP \[bu] 2
+Backend selection is fixed at startup.
+Helper availability alone does not guarantee that the kernel verifier
+accepts the full program.
+.IP \[bu] 2
+A busy memory\-map lock or failed lookup produces no detection for that
+lookup.
+A failed lookup while tracking a new thread clears the inherited stack
+range to avoid false positives.
+.IP \[bu] 2
+The helper backend retries an \f[CR]EBUSY\f[R] fork lookup once at the
+new thread\[cq]s first scheduling hook.
+A second failure leaves the stack untracked and reports
+\f[CR]BPF_LOG_THREAD_STACK_UNAVAILABLE\f[R]; persistent contention and
+IRQ\-disabled PREEMPT_RT contexts are not recovered by this retry.
 .IP \[bu] 2
 Threads created before Tracee starts are not tracked
 .IP \[bu] 2

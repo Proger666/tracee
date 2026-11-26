@@ -930,9 +930,26 @@ clean-traceectl::
 # unit tests
 #
 
+# Native VMA logic only: no kernel probes, BPF loading or syscall fixtures.
+.PHONY: benchmark-vma
+benchmark-vma:: \
+	| .eval_goenv \
+	.checkver_$(CMD_GO)
+#
+	sh scripts/vma_bench.sh
+	$(GO_ENV_EBPF) \
+	$(CMD_GO) test \
+		-tags $(GO_TAGS_EBPF) \
+		-run '^$$' \
+		-bench '^BenchmarkVMA' \
+		-benchtime=100ms \
+		-count=3 \
+		-benchmem \
+		./pkg/ebpf
+
 .PHONY: test-unit
 test-unit:: \
-	$(if $(or $(PKG),$(TEST)),,test-types test-common) \
+	$(if $(or $(PKG),$(TEST)),,test-types test-common test-e2e-detectors) \
 	| .eval_goenv \
 	.checkver_$(CMD_GO)
 #
@@ -977,6 +994,19 @@ test-common:: \
 		-shuffle on \
 		-v \
 		./...
+
+.PHONY: test-e2e-detectors
+test-e2e-detectors:: \
+	| .checkver_$(CMD_GO)
+#
+	@# E2E detector assertions run without BPF privileges in their standalone module.
+	@cd ./detectors && $(CMD_GO) test \
+		-tags e2e \
+		-short \
+		-race \
+		-shuffle on \
+		-v \
+		./e2e
 
 SCRIPTS_TEST_DIR = scripts
 

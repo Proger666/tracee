@@ -40,9 +40,12 @@ Normally, all legitimate code runs from dedicated code regions mapped from execu
 
 ## DEPENDENCIES
 
-**Kernel Probes:**
+**Syscall Monitoring:**
 
-- Individual syscall kprobes (configurable): Placed on selected syscalls for analysis
+- On kernels 6.1 and newer with the required helpers and confirmed BPF JIT support, one raw `sys_enter` tracepoint checks the configured syscall selection maps. VMA lookups use `bpf_find_vma`.
+- The legacy backend attaches individual syscall kprobes and walks the kernel's VMA red-black tree. It cannot find VMAs on kernels that only expose a Maple Tree.
+
+Backend selection happens at startup. A busy memory-map lock or a failed VMA lookup produces no detection for that lookup.
 
 ## CONFIGURATION
 
@@ -78,7 +81,7 @@ Common scenarios triggering this event:
 
 - **Selective monitoring**: Use syscall parameters to monitor specific syscalls only
 - **Deduplication**: Unique combinations of process, syscall, and VMA reported only once
-- **Overhead reduction**: Focuses on specified syscalls rather than all syscalls
+- **VMA lookup cost**: Only selected syscalls perform VMA lookups. The modern raw tracepoint still checks selection maps on every syscall; measure this overhead for the target workload.
 
 ## FALSE POSITIVES
 

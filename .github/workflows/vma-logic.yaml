@@ -1,0 +1,155 @@
+name: VMA logic and build checks
+
+on:
+  push:
+    branches:
+      - fix/vma-maple-tree
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vma-logic-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  logic-and-build:
+    name: Logic and build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOEXPERIMENT: norandomizedheapbase64
+      GOTOOLCHAIN: local
+      GOFIPS140: "off"
+      GOMAXPROCS: "4"
+      CGO_ENABLED: "1"
+
+    steps:
+      - name: Check out the revision under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache: false
+
+      - name: Prepare a local compiler and headers
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          prefix="${RUNNER_TEMP}/vma-toolchain"
+          mkdir -p "${prefix}"/{lists/partial,cache/archives/partial,packages,sources,empty-config}
+          # APT_CONFIG is read before the system configuration fragments;
+          # command-line -o overrides alone would leave their hooks loaded.
+          printf 'Dir::Etc::main "/dev/null";\nDir::Etc::parts "%s";\n' \
+              "${prefix}/empty-config" > "${prefix}/apt.conf"
+          if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+              cp /etc/apt/sources.list.d/ubuntu.sources "${prefix}/sources/"
+          else
+              cp /etc/apt/sources.list "${prefix}/sources/ubuntu.list"
+          fi
+          apt_options=(
+              -o "Dir::Etc::main=/dev/null"
+              -o "Dir::Etc::parts=${prefix}/empty-config"
+              -o "Dir::Etc::sourcelist=/dev/null"
+              -o "Dir::Etc::sourceparts=${prefix}/sources"
+              -o "Dir::State::lists=${prefix}/lists"
+              -o "Dir::Cache=${prefix}/cache"
+              -o "Dir::Cache::pkgcache="
+              -o "Dir::Cache::srcpkgcache="
+          )
+          # Download and unpack only: no package installation, maintainer
+          # scripts, system configuration changes or elevated permissions.
+          APT_CONFIG="${prefix}/apt.conf" apt-get "${apt_options[@]}" update
+          cd "${prefix}/packages"
+          APT_CONFIG="${prefix}/apt.conf" apt-get "${apt_options[@]}" download \
+              clang-19 clang-format-19 llvm-19-linker-tools \
+              libllvm19 libclang-cpp19 libclang1-19 libclang-common-19-dev \
+              libelf-dev libelf1t64 tree
+          for package in ./*.deb; do
+              dpkg-deb --extract "${package}" "${prefix}"
+          done
+          multiarch=$(gcc -print-multiarch)
+          {
+              echo "${prefix}/usr/bin"
+              echo "${prefix}/usr/lib/llvm-19/bin"
+          } >> "${GITHUB_PATH}"
+          {
+              echo "LD_LIBRARY_PATH=${prefix}/usr/lib/${multiarch}:${prefix}/usr/lib/llvm-19/lib"
+              echo "LIBRARY_PATH=${prefix}/usr/lib/${multiarch}"
+              echo "CPATH=${prefix}/usr/include"
+              echo "PKG_CONFIG_LIBDIR=${prefix}/usr/lib/${multiarch}/pkgconfig:$(pkg-config --variable pc_path pkg-config)"
+              echo "CC=clang-19"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build BPF objects and Tracee without loading them
+        run: |
+          set -euo pipefail
+          clang-19 --version
+          go version
+          make CMD_CLANG=clang-19 bpf tracee
+
+      - name: Test VMA values and event-result handling
+        run: |
+          set -euo pipefail
+          sh scripts/vma_logic_test.sh
+          sh scripts/vma_stack_test.sh
+          sh scripts/vma_memory_test.sh
+          bash tests/e2e/test-vma-validation.sh
+
+      - name: Test loader decisions and probe configuration
+        run: |
+          set -euo pipefail
+          make CMD_CLANG=clang-19 test-unit PKG=pkg/ebpf
+
+      - name: Test synthetic detector event streams
+        run: |
+          set -euo pipefail
+          make test-e2e-detectors
+
+      - name: Measure native VMA logic and startup allocations
+        run: |
+          set -euo pipefail
+          make CMD_CLANG=clang-19 benchmark-vma | tee "${RUNNER_TEMP}/vma-benchmarks.txt"
+          {
+              echo "## Native VMA benchmarks"
+              echo "Mock reads/helpers only; these timings are not eBPF or syscall latency."
+              echo '```text'
+              cat "${RUNNER_TEMP}/vma-benchmarks.txt"
+              echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Check formatting and static analysis
+        run: |
+          set -euo pipefail
+          export PATH="$(go env GOPATH)/bin:${PATH}"
+          go install github.com/incu6us/goimports-reviser/v3@fa5587e51ba33c58734984cb41370a5b2582d5b7
+          go install github.com/mgechev/revive@8ece20b0789c517bd3a6742db0daa4dd5928146d
+          go install honnef.co/go/tools/cmd/staticcheck@5af2e5fc3b08ba46027eb48ebddeba34dc0bd02c
+          go install github.com/kisielk/errcheck@11c27a7ce69d583465d80d808817d22d6653ee34
+          make CMD_CLANG=clang-19 check-fmt check-lint check-vet check-staticcheck check-err
+
+      - name: Record the validation scope
+        if: always()
+        run: |
+          {
+              echo "## VMA validation scope"
+              echo "Revision: ${GITHUB_SHA}"
+              echo "Runner: ${{ matrix.runner }}"
+              echo "This run builds objects and exercises userspace logic and synthetic event streams."
+              echo "Kernel loading, verifier acceptance, live detection, executable mappings,"
+              echo "alternate stacks and live-kernel performance are not exercised."
+              echo "Native logic benchmarks report mock read costs and Go allocations."
+              echo "Verification plan: docs/contributing/vma-validation.md."
+          } >> "${GITHUB_STEP_SUMMARY}"

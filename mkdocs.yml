@@ -244,6 +244,7 @@ nav:
           - Adding New Events: contributing/adding-events.md
           - Event Documentation Guide: contributing/event-documentation-guide.md
           - Code Coverage: contributing/testing-coverage.md
+          - VMA Lookup Validation: contributing/vma-validation.md
           - Performance: contributing/performance.md
           - Event Generator (evt): contributing/evt-tool.md
           - Kubernetes: contributing/kubernetes.md
