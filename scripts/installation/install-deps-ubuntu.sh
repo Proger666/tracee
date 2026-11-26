@@ -39,6 +39,7 @@ install_base_packages() {
         tar \
         xz-utils \
         git \
+        jq \
         make \
         ca-certificates \
         wget \

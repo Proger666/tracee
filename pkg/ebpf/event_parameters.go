@@ -1,13 +1,17 @@
 package ebpf
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"syscall"
 	"unsafe"
 
 	"github.com/aquasecurity/tracee/common/errfmt"
 	"github.com/aquasecurity/tracee/common/logger"
+	"github.com/aquasecurity/tracee/pkg/datastores/symbol"
 	"github.com/aquasecurity/tracee/pkg/ebpf/probes"
 	"github.com/aquasecurity/tracee/pkg/events"
 	"github.com/aquasecurity/tracee/pkg/filters"
@@ -57,7 +61,7 @@ func (t *Tracee) handleEventParameters() error {
 			if err := t.eventsDependencies.RemoveEvent(eventID); err != nil {
 				logger.Warnw("Failed to remove event from dependencies manager", "remove reason", "failed handling event parameters", "error", err)
 			}
-			return fmt.Errorf("failed to handle parameters for event %s: %v", events.Core.GetDefinitionByID(eventID).GetName(), err)
+			return fmt.Errorf("failed to handle parameters for event %s: %w", events.Core.GetDefinitionByID(eventID).GetName(), err)
 		}
 	}
 	return nil
@@ -66,6 +70,35 @@ func (t *Tracee) handleEventParameters() error {
 type syscallInfo struct {
 	id   events.ID
 	name string
+}
+
+// This handle is local to the syscall_checkers group. Legacy syscall handles
+// are nonnegative; the modern backend attaches one raw tracepoint for all
+// selected syscalls and both checker events.
+const syscallCheckerRawTracepointHandle probes.Handle = -1
+
+type syscallCheckerProbePlan struct {
+	handle      probes.Handle
+	probeType   probes.ProbeType
+	eventName   string
+	programName string
+}
+
+func planSyscallCheckerProbe(backend vmaLookupBackend, entry syscallInfo) syscallCheckerProbePlan {
+	if backend == vmaLookupHelper {
+		return syscallCheckerProbePlan{
+			handle:      syscallCheckerRawTracepointHandle,
+			probeType:   probes.RawTracepoint,
+			eventName:   "raw_syscalls:sys_enter",
+			programName: backend.syscallCheckerProgram(),
+		}
+	}
+	return syscallCheckerProbePlan{
+		handle:      probes.Handle(entry.id),
+		probeType:   probes.SyscallEnter,
+		eventName:   entry.name,
+		programName: backend.syscallCheckerProgram(),
+	}
 }
 
 func getSyscallsFromParams(eventParams []map[string]filters.Filter[*filters.StringFilter], syscallArgName string) ([]syscallInfo, error) {
@@ -102,8 +135,53 @@ func getSyscallsFromParams(eventParams []map[string]filters.Filter[*filters.Stri
 	return syscalls, nil
 }
 
+// These flags match VMA_CHECK_SOURCE and VMA_CHECK_STACK in the BPF program.
+const (
+	vmaCheckSource uint32 = 1 << iota
+	vmaCheckStack
+)
+
+type vmaSyscallCheckMap interface {
+	GetValue(key unsafe.Pointer) ([]byte, error)
+	Update(key, value unsafe.Pointer) error
+}
+
+type syscallCheckerProbeGroup interface {
+	HandleExists(handle probes.Handle) bool
+	AddProbe(handle probes.Handle, probe probes.Probe) error
+	Attach(handle probes.Handle, args ...interface{}) error
+}
+
+// Event parameter handlers run sequentially during Init. Each event contributes
+// a bit to the shared selection; overlapping policies and the other checker
+// must retain their existing bits.
+func enableVMASyscallCheck(syscallsMap vmaSyscallCheckMap, syscallID, check uint32) error {
+	value, err := syscallsMap.GetValue(unsafe.Pointer(&syscallID))
+	var selected uint32
+	switch {
+	case errors.Is(err, syscall.ENOENT):
+		// This syscall has not been selected by either checker yet.
+	case err != nil:
+		return fmt.Errorf("read VMA checks for syscall %d: %w", syscallID, err)
+	default:
+		if len(value) != 4 {
+			return fmt.Errorf("invalid VMA check value for syscall %d: got %d bytes, want 4", syscallID, len(value))
+		}
+		selected = binary.NativeEndian.Uint32(value)
+	}
+
+	combined := selected | check
+	if combined == selected {
+		return nil
+	}
+	if err := syscallsMap.Update(unsafe.Pointer(&syscallID), unsafe.Pointer(&combined)); err != nil {
+		return fmt.Errorf("enable VMA checks for syscall %d: %w", syscallID, err)
+	}
+	return nil
+}
+
 func registerSyscallChecker(t *Tracee, eventParams []map[string]filters.Filter[*filters.StringFilter],
-	syscallArgName string, selectedSyscallsMapName string) error {
+	syscallArgName string, check uint32) error {
 	// Create probe group if needed
 	probeGroupName := "syscall_checkers"
 	probeGroup, ok := t.extraProbes[probeGroupName]
@@ -119,30 +197,38 @@ func registerSyscallChecker(t *Tracee, eventParams []map[string]filters.Filter[*
 	}
 
 	// Get map of syscalls to be checked
-	syscallsMap, err := t.bpfModule.GetMap(selectedSyscallsMapName)
+	syscallsMap, err := t.bpfModule.GetMap("vma_syscall_checks")
 	if err != nil {
 		return errfmt.WrapError(err)
 	}
 
-	for _, syscall := range syscalls {
-		// Register and attach a probe for this syscall, if not registered already
-		handle := probes.Handle(syscall.id)
-		if !probeGroup.HandleExists(handle) {
-			probe := probes.NewTraceProbe(probes.SyscallEnter, syscall.name, "syscall_checker")
-			if err := probeGroup.AddProbe(handle, probe); err != nil {
+	return registerVMASyscallCheckers(probeGroup, syscallsMap, t.vmaLookupBackend, syscalls, check, t.getKernelSymbols())
+}
+
+func registerVMASyscallCheckers(probeGroup syscallCheckerProbeGroup, syscallsMap vmaSyscallCheckMap,
+	backend vmaLookupBackend, syscalls []syscallInfo, check uint32, kernelSymbols *symbol.KernelSymbolTable) error {
+	for _, entry := range syscalls {
+		// Modern checks share one raw syscall entry tracepoint. Legacy checks
+		// retain individual syscall kprobes.
+		plan := planSyscallCheckerProbe(backend, entry)
+		if !probeGroup.HandleExists(plan.handle) {
+			probe := probes.NewTraceProbe(plan.probeType, plan.eventName, plan.programName)
+			if err := probeGroup.AddProbe(plan.handle, probe); err != nil {
 				return errfmt.WrapError(err)
 			}
-			if err := probeGroup.Attach(handle, t.getKernelSymbols()); err != nil {
-				// Report attachment errors but don't fail, because it may be a syscall that doesn't exist on this system
-				logger.Warnw("Failed to attach syscall checker kprobe", "syscall", syscall.name, "error", err)
-				continue
+		}
+		// A registered handle can remain after a failed attachment. Attach is
+		// idempotent for an active probe and retries an unattached one.
+		if err := probeGroup.Attach(plan.handle, kernelSymbols); err != nil {
+			if backend == vmaLookupHelper {
+				return fmt.Errorf("attach VMA syscall entry tracepoint: %w", err)
 			}
+			// Report attachment errors but don't fail, because it may be a syscall that doesn't exist on this system
+			logger.Warnw("Failed to attach syscall checker kprobe", "syscall", entry.name, "error", err)
+			continue
 		}
 
-		// Update syscalls to check map with this syscall
-		id := uint32(syscall.id)
-		val := uint32(1)
-		if err := syscallsMap.Update(unsafe.Pointer(&id), unsafe.Pointer(&val)); err != nil {
+		if err := enableVMASyscallCheck(syscallsMap, uint32(entry.id), check); err != nil {
 			return errfmt.WrapError(err)
 		}
 	}
@@ -151,9 +237,9 @@ func registerSyscallChecker(t *Tracee, eventParams []map[string]filters.Filter[*
 }
 
 func prepareSuspiciousSyscallSource(t *Tracee, eventParams []map[string]filters.Filter[*filters.StringFilter]) error {
-	return registerSyscallChecker(t, eventParams, "syscall", "suspicious_syscall_source_syscalls")
+	return registerSyscallChecker(t, eventParams, "syscall", vmaCheckSource)
 }
 
 func prepareStackPivot(t *Tracee, eventParams []map[string]filters.Filter[*filters.StringFilter]) error {
-	return registerSyscallChecker(t, eventParams, "syscall", "stack_pivot_syscalls")
+	return registerSyscallChecker(t, eventParams, "syscall", vmaCheckStack)
 }

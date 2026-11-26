@@ -39,6 +39,7 @@ INSTTESTS_CORE_AVAILABLE="
     SET_FS_PWD
     STACK_PIVOT
     SUSPICIOUS_SYSCALL_SOURCE
+    VMA_LOOKUP
     VFS_WRITE
     WRITABLE_DATA_STORE
 "
@@ -64,6 +65,7 @@ core_init_test_config() {
     add_test_config TEST_CONFIG_MAP "SET_FS_PWD"                 "set-fs-pwd-test"                5       0     0
     add_test_config TEST_CONFIG_MAP "STACK_PIVOT"                "stack-pivot-test"              10       5     0
     add_test_config TEST_CONFIG_MAP "SUSPICIOUS_SYSCALL_SOURCE"  "suspicious-syscall-src-test"   10       0     0
+    add_test_config TEST_CONFIG_MAP "VMA_LOOKUP"                 "vma-lookup-test"              15       0     0
     add_test_config TEST_CONFIG_MAP "VFS_WRITE"                  "vfs-write-test"                 5       0     0
     add_test_config TEST_CONFIG_MAP "WRITABLE_DATA_STORE"        "writable-ds-test"              40       0     0
 }
@@ -83,6 +85,10 @@ core_skip_security_path_notify=0
 core_skip_suspicious_syscall_source=0
 # shellcheck disable=SC2034
 core_skip_stack_pivot=0
+# shellcheck disable=SC2034
+core_skip_vma_lookup=0
+# A modern kernel must exercise the helper backend; fallback is a failure, not coverage.
+core_vma_backend_missing=0
 # shellcheck disable=SC2034
 core_lsm_test_not_supported=0
 
@@ -112,6 +118,9 @@ core_should_skip_test() {
         STACK_PIVOT)
             [[ "${core_skip_stack_pivot:-0}" -eq 1 ]]
             ;;
+        VMA_LOOKUP)
+            [[ "${core_skip_vma_lookup:-0}" -eq 1 ]]
+            ;;
         LSM_TEST)
             [[ "${core_lsm_test_not_supported:-0}" -eq 1 ]]
             ;;
@@ -119,6 +128,35 @@ core_should_skip_test() {
             false
             ;;
     esac
+}
+
+# Check the backend Tracee actually loaded instead of guessing helper support from
+# kernel symbols. Called after startup, while debug logging is enabled.
+core_update_vma_test_support() {
+    local logfile="$1"
+    if ! grep -Eq '(^|[[:space:]])(SUSPICIOUS_SYSCALL_SOURCE|STACK_PIVOT|VMA_LOOKUP)([[:space:]]|$)' \
+        <<< "${INSTTESTS_CORE:-}"; then
+        return
+    fi
+    local major="${KERNEL%%.*}"
+    local remainder="${KERNEL#*.}"
+    local minor="${remainder%%.*}"
+    minor="${minor%%-*}"
+
+    if grep -Eq 'Selected VMA lookup backend.*"backend": *"bpf_find_vma"' "${logfile}"; then
+        return
+    fi
+
+    if (( major > 6 || (major == 6 && minor >= 1) )); then
+        error "VMA tests require the bpf_find_vma backend on kernel ${KERNEL}; they will fail"
+        core_vma_backend_missing=1
+    elif grep -qP "trace.*vma_store" /proc/kallsyms; then
+        # Maple Tree backports below the loader's supported version remain unsupported.
+        info "skip VMA tests on kernel ${KERNEL} (Maple Tree backport without helper backend)"
+        core_skip_suspicious_syscall_source=1
+        core_skip_stack_pivot=1
+        core_skip_vma_lookup=1
+    fi
 }
 
 # ==============================================================================
@@ -182,26 +220,23 @@ core_test_setup() {
             ;;
 
         SUSPICIOUS_SYSCALL_SOURCE)
-            if grep -qP "trace.*vma_store" /proc/kallsyms; then
-                info "skip ${test} test on kernel ${KERNEL} (VMAs stored in maple tree)"
-                core_skip_suspicious_syscall_source=1
-            else
-                info "compiling suspicious syscall source test..."
-                if ! ./tests/e2e/core/scripts/suspicious_syscall_source.sh --build; then
-                    error "could not compile suspicious_syscall_source"
-                fi
+            info "compiling suspicious syscall source test..."
+            if ! ./tests/e2e/core/scripts/suspicious_syscall_source.sh --build; then
+                die "could not compile suspicious_syscall_source"
             fi
             ;;
 
         STACK_PIVOT)
-            if grep -qP "trace.*vma_store" /proc/kallsyms; then
-                info "skip ${test} test on kernel ${KERNEL} (VMAs stored in maple tree)"
-                core_skip_stack_pivot=1
-            else
-                info "compiling stack pivot test..."
-                if ! ./tests/e2e/core/scripts/stack_pivot.sh --build; then
-                    error "could not compile stack_pivot"
-                fi
+            info "compiling stack pivot test..."
+            if ! ./tests/e2e/core/scripts/stack_pivot.sh --build; then
+                die "could not compile stack_pivot"
+            fi
+            ;;
+
+        VMA_LOOKUP)
+            info "compiling VMA lookup regression test..."
+            if ! ./tests/e2e/core/scripts/vma_lookup.sh --build; then
+                die "could not compile vma_lookup"
             fi
             ;;
 
@@ -300,6 +335,7 @@ core_test_run() {
             BPF_ATTACH | \
             SUSPICIOUS_SYSCALL_SOURCE | \
             STACK_PIVOT | \
+            VMA_LOOKUP | \
             WRITABLE_DATA_STORE | \
             SECURITY_PATH_NOTIFY | \
             PROCTREE_DATA_STORE | \
@@ -341,6 +377,24 @@ core_test_teardown() {
 # ==============================================================================
 # Core Test Check Phase
 # ==============================================================================
+# The VMA fixtures must complete every scenario successfully. Other tests retain
+# their event-based result contract; for example, DNS_DATA_STORE can observe a
+# valid DNS response even when ping receives no ICMP reply and exits nonzero.
+core_check_fixture_exit() {
+    local test="$1"
+    local exit_status="$2"
+
+    case ${test} in
+        SUSPICIOUS_SYSCALL_SOURCE | STACK_PIVOT | VMA_LOOKUP)
+            if [[ "${exit_status}" -ne 0 ]]; then
+                error "${test}: fixture failed with exit status ${exit_status}"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
 # Validate a single core test result
 # Arguments:
 #   $1 - Test name
@@ -356,6 +410,21 @@ core_test_check() {
     local policy_name
     local match_count
 
+    case ${test} in
+        SUSPICIOUS_SYSCALL_SOURCE | STACK_PIVOT | VMA_LOOKUP)
+            if [[ "${core_vma_backend_missing}" -eq 1 ]]; then
+                error "${test}: expected bpf_find_vma backend was not selected"
+                return 1
+            fi
+            ;;
+    esac
+
+    # A late false positive must fail even if the detector emitted success earlier.
+    if [[ "${test}" == "VMA_LOOKUP" ]] && grep -q 'VMA_LOOKUP validation failed' "${logfile}"; then
+        error "VMA_LOOKUP: unexpected event or invalid mapping metadata"
+        return 1
+    fi
+
     # Get policy and match count for all core tests
     case ${test} in
         SET_FS_PWD | \
@@ -367,6 +436,7 @@ core_test_check() {
             HOOKED_SYSCALL | \
             PROCESS_EXECUTE_FAILED | \
             STACK_PIVOT | \
+            VMA_LOOKUP | \
             FTRACE_HOOK | \
             BPF_ATTACH | \
             DNS_DATA_STORE | \

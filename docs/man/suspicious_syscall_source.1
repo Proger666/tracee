@@ -41,10 +41,20 @@ Size of the VMA containing the triggering code
 \f[B]vma_flags\f[R] (\f[I]uint64\f[R])
 VMA flags (decoded to names if decoded\-data enabled)
 .SS DEPENDENCIES
-\f[B]Kernel Probes:\f[R]
+\f[B]Syscall Monitoring:\f[R]
 .IP \[bu] 2
-Individual syscall kprobes (configurable): Placed on selected syscalls
-for analysis
+On kernels 6.1 and newer with the required helpers and confirmed BPF JIT
+support, one raw \f[CR]sys_enter\f[R] tracepoint checks the configured
+syscall selection maps.
+VMA lookups use \f[CR]bpf_find_vma\f[R].
+.IP \[bu] 2
+The legacy backend attaches individual syscall kprobes and walks the
+kernel\[cq]s VMA red\-black tree.
+It cannot find VMAs on kernels that only expose a Maple Tree.
+.PP
+Backend selection happens at startup.
+A busy memory\-map lock or a failed VMA lookup produces no detection for
+that lookup.
 .SS CONFIGURATION
 Use event parameters to specify which syscalls to monitor:
 .IP
@@ -87,8 +97,9 @@ specific syscalls only
 \f[B]Deduplication\f[R]: Unique combinations of process, syscall, and
 VMA reported only once
 .IP \[bu] 2
-\f[B]Overhead reduction\f[R]: Focuses on specified syscalls rather than
-all syscalls
+\f[B]VMA lookup cost\f[R]: Only selected syscalls perform VMA lookups.
+The modern raw tracepoint still checks selection maps on every syscall;
+measure this overhead for the target workload.
 .SS FALSE POSITIVES
 Legitimate scenarios that may trigger this event:
 .IP \[bu] 2

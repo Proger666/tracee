@@ -270,7 +270,7 @@ statfunc bool reset_event(event_data_t *event, u32 event_id)
 
 statfunc bool thread_stack_tracked(task_info_t *task_info)
 {
-    return task_info->stack.start != 0 && task_info->stack.end != 0;
+    return task_info->stack.start < task_info->stack.end;
 }
 
 #endif

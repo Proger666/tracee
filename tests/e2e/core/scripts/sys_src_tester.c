@@ -35,7 +35,7 @@ int main(int argc, char *argv[])
     if (strcmp(argv[1], "stack") == 0) {
         char shellcode_stack[] = SHELLCODE;
 #if defined(__aarch64__)
-        __builtin___clear_cache(&shellcode_stack, &shellcode_stack + sizeof(shellcode));
+        __builtin___clear_cache(shellcode_stack, shellcode_stack + sizeof(shellcode_stack));
 #endif
         ((void (*)(void)) shellcode_stack)();
         // cannot be reached
@@ -61,7 +61,7 @@ int main(int argc, char *argv[])
 
         // jump to the shellcode
 #if defined(__aarch64__)
-        __builtin___clear_cache(&shellcode_heap, &shellcode_heap + sizeof(shellcode));
+        __builtin___clear_cache(shellcode_heap, (char *) shellcode_heap + sizeof(shellcode));
 #endif
         ((void (*)(void)) shellcode_heap)();
 
@@ -86,7 +86,7 @@ int main(int argc, char *argv[])
 
         // jump to the shellcode
 #if defined(__aarch64__)
-        __builtin___clear_cache(&shellcode_mmap, &shellcode_mmap + sizeof(shellcode));
+        __builtin___clear_cache(shellcode_mmap, (char *) shellcode_mmap + sizeof(shellcode));
 #endif
         ((void (*)(void)) shellcode_mmap)();
 
@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
     }
 
 usage:
-    printf("usage: ./sys_src_tester [stack|heap|mmap]\n");
+    printf("usage: ./sys_src_tester [stack|heap|mmap|thread-stack]\n");
 fail:
     exit(EXIT_FAILURE);
 }
@@ -132,7 +132,7 @@ void *thread_func(void *arg)
 
     // jump to the shellcode
 #if defined(__aarch64__)
-    __builtin___clear_cache(&shellcode_stack, &shellcode_stack + sizeof(shellcode));
+    __builtin___clear_cache(shellcode_stack, shellcode_stack + sizeof(shellcode_stack));
 #endif
     ((void (*)(void)) shellcode_stack)();
 

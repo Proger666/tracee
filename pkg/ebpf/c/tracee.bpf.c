@@ -37,6 +37,8 @@
 #include <common/network.h>
 #include <common/probes.h>
 #include <common/signal.h>
+#include <common/vma_stack.h>
+#include <common/vma_checks.h>
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -576,51 +578,87 @@ int sys_dup_exit_tail(void *ctx)
     return 0;
 }
 
-statfunc void update_thread_stack(void *ctx, task_info_t *task_info, struct task_struct *task)
+statfunc void update_thread_stack(void *ctx,
+                                  task_info_t *task_info,
+                                  struct task_struct *task,
+                                  bool use_vma_helper)
 {
-    // Kernel threads and group leaders are not relevant, reset their stack area
-    if (get_task_flags(task) & PF_KTHREAD ||
-        BPF_CORE_READ(task, pid) == BPF_CORE_READ(task, tgid)) {
-        task_info->stack = (address_range_t) {0};
+    // The fork handler copied the parent's task info. No failed child lookup
+    // may leave the parent's stack range behind.
+    reset_thread_stack(task_info);
+
+    // Kernel threads and group leaders do not use tracked thread-stack ranges.
+    if (get_task_flags(task) & PF_KTHREAD || BPF_CORE_READ(task, pid) == BPF_CORE_READ(task, tgid))
         return;
-    }
 
     // Get user SP of new thread
+    u64 thread_sp = 0;
 #if defined(bpf_target_x86)
-    struct fork_frame *fork_frame = (struct fork_frame *) BPF_CORE_READ(task, thread.sp);
-    u64 thread_sp = BPF_CORE_READ(fork_frame, regs.sp);
+    struct fork_frame *fork_frame = NULL;
+    if (BPF_CORE_READ_INTO(&fork_frame, task, thread.sp) || fork_frame == NULL ||
+        BPF_CORE_READ_INTO(&thread_sp, fork_frame, regs.sp))
+        return;
 #elif defined(bpf_target_arm64)
-    struct pt_regs *thread_regs = (struct pt_regs *) BPF_CORE_READ(task, thread.cpu_context.sp);
-    u64 thread_sp = BPF_CORE_READ(thread_regs, sp);
+    struct pt_regs *thread_regs = NULL;
+    if (BPF_CORE_READ_INTO(&thread_regs, task, thread.cpu_context.sp) || thread_regs == NULL ||
+        BPF_CORE_READ_INTO(&thread_sp, thread_regs, sp))
+        return;
 #else
     #error Unsupported architecture
 #endif
+    if (thread_sp == 0)
+        return;
 
     // Find VMA which contains the SP.
-    // We subtract 1 fromt the SP because it may be just past the end of the VMA (top of the stack).
+    // We subtract 1 from the SP because it may be just past the end of the VMA (top of the stack).
     // For example: stack VMA mapped at 0x1000 with size 0x1000,
     // SP is set to 0x2000 (which is not part of the VMA whose address range is 0x1000-0x1fff).
-    struct vm_area_struct *vma = find_vma(ctx, task, thread_sp - 1);
-    if (unlikely(vma == NULL)) {
-        // Some rare race conditions may cause the VMA lookup to fail.
-        // Try the lookup again, and in the exceedingly rare case that the
-        // second lookup fails as well, reset the stack area to indicate
-        // that this thread's stack isn't tracked, to prevent false positives.
-        vma = find_vma(ctx, task, thread_sp - 1);
-        if (unlikely(vma == NULL)) {
-            task_info->stack = (address_range_t) {0};
-            return;
-        }
+    address_range_t bounds = {};
+    long ret;
+    if (use_vma_helper) {
+        // Only nonleader userspace threads reach this lookup. CLONE_THREAD
+        // requires CLONE_VM, so the child shares the current parent's mm.
+        // Use the typed current task rather than the raw tracepoint argument.
+        ret = find_vma_bounds_current(bpf_get_current_task_btf(), thread_sp - 1, &bounds);
+    } else {
+        ret = find_vma_bounds_legacy(ctx, task, thread_sp - 1, &bounds);
+        if (unlikely(ret != 0))
+            ret = find_vma_bounds_legacy(ctx, task, thread_sp - 1, &bounds);
     }
+    // A busy helper gets one later attempt in the child's first scheduling
+    // hook, before any child userspace code can change its stack pointer.
+    // Never spin on mmap_lock or retry after the child has entered userspace.
+    record_thread_stack_lookup(task_info, thread_sp, ret, bounds, use_vma_helper);
+}
 
-    // Add the VMA address range to the task info
-    task_info->stack = (address_range_t) {.start = BPF_CORE_READ(vma, vm_start),
-                                          .end = BPF_CORE_READ(vma, vm_end)};
+SEC("kprobe/schedule_tail")
+int BPF_KPROBE(trace_schedule_tail_vma)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tid = pid_tgid;
+    if (tid == pid_tgid >> 32)
+        return 0;
+    task_info_t *task_info = bpf_map_lookup_elem(&task_info_map, &tid);
+    if (task_info == NULL || !task_info->stack_lookup_pending)
+        return 0;
+
+    // schedule_tail runs once in a new task, after the mm switch and before
+    // its first userspace instruction on both x86_64 and ARM64. Only the
+    // saved, kernel-initialized SP is trusted; a later current SP is not.
+    struct task_struct *task = bpf_get_current_task_btf();
+    u64 thread_sp = consume_thread_stack_retry(task_info, get_task_start_time(task));
+    if (thread_sp == 0)
+        return 0;
+
+    address_range_t bounds = {};
+    long ret = find_vma_bounds_current(task, thread_sp - 1, &bounds);
+    if (!record_thread_stack_lookup(task_info, thread_sp, ret, bounds, false))
+        tracee_log(ctx, BPF_LOG_LVL_WARN, BPF_LOG_THREAD_STACK_UNAVAILABLE, ret);
+    return 0;
 }
 
 // trace/events/sched.h: TP_PROTO(struct task_struct *parent, struct task_struct *child)
-SEC("raw_tracepoint/sched_process_fork")
-int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
+statfunc int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx, bool use_vma_helper)
 {
     long ret = 0;
     program_data_t p = {};
@@ -658,9 +696,12 @@ int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
     task->context.start_time = child_start_time;
 
     // Track thread stack if needed
-    if (event_is_selected(SUSPICIOUS_SYSCALL_SOURCE, p.event->context.policies_version) ||
-        event_is_selected(STACK_PIVOT, p.event->context.policies_version))
-        update_thread_stack(ctx, task, child);
+    if (child_pid != child_tid &&
+        (event_is_selected(SUSPICIOUS_SYSCALL_SOURCE, p.event->context.policies_version) ||
+         event_is_selected(STACK_PIVOT, p.event->context.policies_version)))
+        update_thread_stack(ctx, task, child, use_vma_helper);
+    else
+        reset_thread_stack(task);
 
     // Update the proc_info_map with the new process's info (from parent)
 
@@ -774,6 +815,20 @@ int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
     events_perf_submit(&p);
 
     return 0;
+}
+
+// Keep callbacks out of the legacy program's call graph. Some older kernels
+// reject BPF-to-BPF calls combined with tail calls, even in an unused branch.
+SEC("raw_tracepoint/sched_process_fork")
+int tracepoint__sched__sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
+{
+    return handle_sched_process_fork(ctx, false);
+}
+
+SEC("raw_tracepoint/sched_process_fork")
+int tracepoint__sched__sched_process_fork_vma(struct bpf_raw_tracepoint_args *ctx)
+{
+    return handle_sched_process_fork(ctx, true);
 }
 
 #define MAX_NUM_MODULES          330
@@ -1408,7 +1463,7 @@ int tracepoint__sched__sched_process_exec(struct bpf_raw_tracepoint_args *ctx)
         return 0;
     
     // Reset thread stack area
-    p.task_info->stack = (address_range_t){0};
+    reset_thread_stack(p.task_info);
 
     // Perform checks below before evaluate_scope_filters(), so tracee can filter by newly created containers
     // or processes. Assume that a new container, or pod, has started when a process of a newly
@@ -5656,160 +5711,26 @@ int BPF_KPROBE(trace_security_task_prctl)
 // Syscall checkers
 //
 
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_EVENT_ID);
-    __type(key, u32);
-    __type(value, u32);
-} suspicious_syscall_source_syscalls SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_EVENT_ID);
-    __type(key, u32);
-    __type(value, u32);
-} stack_pivot_syscalls SEC(".maps");
-
-statfunc void check_suspicious_syscall_source(void *ctx, struct pt_regs *regs, u32 syscall)
-{
-    program_data_t p = {};
-    if (!init_program_data(&p, ctx, SUSPICIOUS_SYSCALL_SOURCE))
-        return;
-
-    if (!evaluate_scope_filters(&p))
-        return;
-
-    // Get instruction pointer
-    u64 ip = PT_REGS_IP_CORE(regs);
-
-    // Find VMA which contains the instruction pointer
-    struct task_struct *task = (struct task_struct *) bpf_get_current_task();
-    if (unlikely(task == NULL))
-        return;
-    struct vm_area_struct *vma = find_vma(ctx, task, ip);
-    if (unlikely(vma == NULL))
-        return;
-
-    // If the VMA is file-backed, the syscall is determined to be legitimate
-    if (vma_is_file_backed(vma))
-        return;
-
-    // In 32-bit compat mode, syscalls may be invoked by calling into a VDSO provided
-    // syscall handler (the vsyscall mechanism).
-    // Even the 64-bit VDSO may invoke syscalls, as a fallback mechanism.
-    // In such cases, we don't know where was the code that called into the VDSO.
-    if (vma_is_vdso(vma))
-        return;
-
-    // Build a key that identifies the combination of syscall,
-    // source VMA and process so we don't submit it multiple times
-    syscall_source_key_t key = {.syscall = syscall,
-                                .tgid = get_task_host_tgid(task),
-                                .tgid_start_time = get_task_start_time(get_leader_task(task)),
-                                .vma_addr = BPF_CORE_READ(vma, vm_start)};
-    bool val = true;
-
-    // Try updating the map with the requirement that this key does not exist yet
-    if ((int) bpf_map_update_elem(&syscall_source_map, &key, &val, BPF_NOEXIST) == -EEXIST)
-        // This key already exists, no need to submit the same syscall-vma-process combination again
-        return;
-
-    enum vma_type vma_type = get_vma_type(vma);
-    if (vma_type == VMA_ANON && address_in_thread_stack(p.task_info, ip))
-        vma_type = VMA_THREAD_STACK;
-
-    const char *vma_type_str = get_vma_type_str(vma_type);
-    unsigned long vma_start = BPF_CORE_READ(vma, vm_start);
-    unsigned long vma_size = BPF_CORE_READ(vma, vm_end) - vma_start;
-    unsigned long vma_flags = BPF_CORE_READ(vma, vm_flags);
-
-    save_to_submit_buf(&p.event->args_buf, &syscall, sizeof(syscall), 0);
-    save_to_submit_buf(&p.event->args_buf, &ip, sizeof(ip), 1);
-    save_str_to_buf(&p.event->args_buf, (void *) vma_type_str, 2);
-    save_to_submit_buf(&p.event->args_buf, &vma_start, sizeof(vma_start), 3);
-    save_to_submit_buf(&p.event->args_buf, &vma_size, sizeof(vma_size), 4);
-    save_to_submit_buf(&p.event->args_buf, &vma_flags, sizeof(vma_flags), 5);
-
-    events_perf_submit(&p);
-}
-
-statfunc void check_stack_pivot(void *ctx, struct pt_regs *regs, u32 syscall)
-{
-    program_data_t p = {};
-
-    if (!init_program_data(&p, ctx, STACK_PIVOT))
-        return;
-
-    if (!evaluate_scope_filters(&p))
-        return;
-
-    // Get stack pointer
-    u64 sp = PT_REGS_SP_CORE(regs);
-
-    // Find VMA which contains the stack pointer
-    struct task_struct *task = (struct task_struct *) bpf_get_current_task();
-    if (unlikely(task == NULL))
-        return;
-    struct vm_area_struct *vma = find_vma(ctx, task, sp);
-    if (unlikely(vma == NULL))
-        return;
-
-    // Check if the stack pointer points to the stack region.
-    //
-    // Goroutine stacks are allocated on golang's heap, which means that an
-    // exploit performing a stack pivot on a go program will result in a false
-    // negative if the new stack location is on golang's heap.
-    //
-    // To identify thread stacks, they need to be tracked when new threads are
-    // created. This means that we cannot identify stacks of threads that were
-    // created before tracee started. To avoid false positives, we ignore events
-    // where the stack pointer's VMA might be a thread stack but it was not
-    // tracked for this thread. This may result in false negatives.
-    enum vma_type vma_type = get_vma_type(vma);
-    if (vma_type == VMA_MAIN_STACK || vma_type == VMA_GOLANG_HEAP || vma_type == VMA_THREAD_STACK ||
-        (vma_type == VMA_ANON &&
-         (!thread_stack_tracked(p.task_info) || address_in_thread_stack(p.task_info, sp))))
-        return;
-
-    const char *vma_type_str = get_vma_type_str(vma_type);
-    unsigned long vma_start = BPF_CORE_READ(vma, vm_start);
-    unsigned long vma_size = BPF_CORE_READ(vma, vm_end) - vma_start;
-    unsigned long vma_flags = BPF_CORE_READ(vma, vm_flags);
-
-    save_to_submit_buf(&p.event->args_buf, &syscall, sizeof(syscall), 0);
-    save_to_submit_buf(&p.event->args_buf, &sp, sizeof(sp), 1);
-    save_str_to_buf(&p.event->args_buf, (void *) vma_type_str, 2);
-    save_to_submit_buf(&p.event->args_buf, &vma_start, sizeof(vma_start), 3);
-    save_to_submit_buf(&p.event->args_buf, &vma_size, sizeof(vma_size), 4);
-    save_to_submit_buf(&p.event->args_buf, &vma_flags, sizeof(vma_flags), 5);
-
-    events_perf_submit(&p);
-}
-
 SEC("kprobe/syscall_checker")
 int BPF_KPROBE(syscall_checker)
 {
-    // Get user registers
     struct pt_regs *regs = ctx;
     if (get_kconfig(ARCH_HAS_SYSCALL_WRAPPER))
         regs = (struct pt_regs *) PT_REGS_PARM1(ctx);
 
-    // Get syscall ID
-    u32 syscall = get_syscall_id_from_regs(regs);
-    if (is_compat((struct task_struct *) bpf_get_current_task())) {
-        u32 *id_64 = bpf_map_lookup_elem(&sys_32_to_64_map, &syscall);
-        if (id_64 == NULL)
-            return 0;
-        syscall = *id_64;
-    }
+    return handle_syscall_checker(ctx, regs, get_syscall_id_from_regs(regs), false);
+}
 
-    if (bpf_map_lookup_elem(&suspicious_syscall_source_syscalls, &syscall) != NULL)
-        check_suspicious_syscall_source(ctx, regs, syscall);
-
-    if (bpf_map_lookup_elem(&stack_pivot_syscalls, &syscall) != NULL)
-        check_stack_pivot(ctx, regs, syscall);
-
-    return 0;
+// Syscall entry runs outside the IRQ-disabled breakpoint context of kprobes.
+// With IRQs disabled, bpf_find_vma defers mmap_unlock via per-CPU irq_work;
+// a second lookup in that context can then fail with -EBUSY. Use the raw
+// syscall tracepoint so both IP and SP checks can acquire/release mmap_lock.
+// The selection map still restricts each check to the syscalls selected by policy.
+SEC("raw_tracepoint/sys_enter")
+int syscall_checker_vma(struct bpf_raw_tracepoint_args *ctx)
+{
+    struct pt_regs *regs = (struct pt_regs *) ctx->args[0];
+    return handle_syscall_checker(ctx, regs, ctx->args[1], true);
 }
 
 SEC("kprobe/security_sb_umount")

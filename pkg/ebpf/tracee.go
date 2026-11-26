@@ -92,11 +92,12 @@ type Tracee struct {
 	readFiles   map[string]string
 	pidsInMntns bucketcache.BucketCache // first n PIDs in each mountns
 	// eBPF
-	bpfModule       *bpf.Module
-	defaultProbes   *probes.ProbeGroup
-	extraProbes     map[string]*probes.ProbeGroup
-	dataTypeDecoder bufferdecoder.TypeDecoder
-	kallsymsMutex   sync.Mutex // prevents concurrent UpdateKallsyms calls
+	bpfModule        *bpf.Module
+	defaultProbes    *probes.ProbeGroup
+	extraProbes      map[string]*probes.ProbeGroup
+	vmaLookupBackend vmaLookupBackend
+	dataTypeDecoder  bufferdecoder.TypeDecoder
+	kallsymsMutex    sync.Mutex // prevents concurrent UpdateKallsyms calls
 	// BPF Maps
 	StackAddressesMap *bpf.BPFMap
 	FDArgPathMap      *bpf.BPFMap
@@ -742,6 +743,7 @@ func (t *Tracee) Init(ctx gocontext.Context) error {
 		},
 	)
 	if err != nil {
+		t.Close()
 		return errfmt.WrapError(err)
 	}
 
@@ -1716,6 +1718,9 @@ func (t *Tracee) initBPF() error {
 
 	// Load the eBPF object into kernel
 
+	if err := t.configureVMAPrograms(); err != nil {
+		return errfmt.WrapError(err)
+	}
 	t.setProgramsAutoload()
 	t.setMapsAutocreate()
 
@@ -1816,6 +1821,11 @@ func (t *Tracee) initBPF() error {
 	// TODO: Solve race window between ProcessTreeFilters initialization through procfs and the
 	// attachment of the probes that update the filters from the eBPF side. Maybe perform another
 	// iteration on procfs to fill in any missing data.
+
+	err = t.attachVMAStackRecovery()
+	if err != nil {
+		return errfmt.WrapError(err)
+	}
 
 	err = t.attachProbes()
 	if err != nil {
@@ -2078,7 +2088,49 @@ func (t *Tracee) computeOutFileHash(fileName string) (string, error) {
 	return digest.ComputeFileHash(f)
 }
 
-// getSelfLoadedPrograms returns a map of all programs loaded by tracee.
+type selfLoadedProbe interface {
+	GetProgramName() string
+	GetEventName() string
+	GetProbeType() probes.ProbeType
+	IsAttached() bool
+}
+
+type selfLoadedProbeKey struct {
+	programName string
+	eventName   string
+	probeType   probes.ProbeType
+}
+
+// recordSelfLoadedProbe counts each attached hook once, even when multiple
+// event dependencies reference it. Failed attachments must not hide other hooks.
+func recordSelfLoadedProbe(counts map[string]int, seen map[selfLoadedProbeKey]struct{}, probe selfLoadedProbe, kprobesOnly bool) bool {
+	if probe == nil {
+		return false
+	}
+	if traceProbe, ok := probe.(*probes.TraceProbe); ok && traceProbe == nil {
+		return false
+	}
+	if !probe.IsAttached() {
+		return false
+	}
+	probeType := probe.GetProbeType()
+	if kprobesOnly && probeType != probes.KProbe && probeType != probes.KretProbe {
+		return false
+	}
+	key := selfLoadedProbeKey{
+		programName: probe.GetProgramName(),
+		eventName:   probe.GetEventName(),
+		probeType:   probeType,
+	}
+	if _, found := seen[key]; found {
+		return false
+	}
+	seen[key] = struct{}{}
+	counts[key.eventName]++
+	return true
+}
+
+// getSelfLoadedPrograms returns the hook counts used to exclude Tracee's probes.
 func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 	selfLoadedPrograms := map[string]int{} // map k: symbol name, v: number of hooks
 
@@ -2086,11 +2138,6 @@ func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 		logger.Debugw("self loaded program", "event", event, "program", program)
 	}
 
-	type probeMapKey struct {
-		programName string
-		eventName   string
-		probeType   probes.ProbeType
-	}
 	// We need to count how many ftrace based hooks will be placed on each symbol.
 	// eventsState may contain duplicate events due to dependencies.
 	// To get the real count, we consider the program name and the prob type.
@@ -2102,7 +2149,7 @@ func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 	// eventName: do_init_module, programName: trace_ret_do_init_module, probtype: 1, definitionID: 760
 	// Even though there are 4 entries, we can see that only 2 hooks are going to be placed in practice.
 	// The symbol is do_init_module: kprobe with the program trace_do_init_module, kretprobe with the program trace_ret_do_init_module
-	uniqueHooksMap := map[probeMapKey]struct{}{}
+	uniqueHooksMap := map[selfLoadedProbeKey]struct{}{}
 
 	for _, tr := range t.eventsDependencies.GetEvents() {
 		definition := events.Core.GetDefinitionByID(tr)
@@ -2117,7 +2164,6 @@ func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 
 		for _, depProbes := range eventNode.GetDependencies().GetProbes() {
 			currProbe := t.defaultProbes.GetProbeByHandle(depProbes.GetHandle())
-			name := ""
 
 			// Only log all other probe types except TraceProbe
 			p, ok := currProbe.(*probes.TraceProbe)
@@ -2128,36 +2174,18 @@ func (t *Tracee) getSelfLoadedPrograms(kprobesOnly bool) map[string]int {
 				}
 				continue
 			}
-			// Perform the rest of the logic for TraceProbe
-			// Only k[ret]probes may use ftrace
-			if kprobesOnly {
-				switch p.GetProbeType() {
-				case probes.KProbe, probes.KretProbe:
-				default:
-					continue
-				}
+			if recordSelfLoadedProbe(selfLoadedPrograms, uniqueHooksMap, p, kprobesOnly) {
+				log(eventName, p.GetProgramName())
 			}
-			if !p.IsAttached() {
-				// Don't fill the map with entries that didn't get hook (missing symbol etc)
-				continue
-			}
-			key := probeMapKey{
-				programName: p.GetProgramName(),
-				probeType:   p.GetProbeType(),
-				eventName:   p.GetEventName(),
-			}
+		}
+	}
 
-			_, found := uniqueHooksMap[key]
-			if found { // Already counted this hook
-				continue
-			}
-
-			uniqueHooksMap[key] = struct{}{}
-
-			log(eventName, p.GetProgramName())
-			name = p.GetEventName()
-
-			selfLoadedPrograms[name]++
+	// Stack recovery is attached outside the event dependency manager. Include
+	// its actual attachment so ftrace_hook does not report Tracee's own kprobe.
+	if group := t.extraProbes[vmaStackRecoveryGroupName]; group != nil {
+		probe, ok := group.GetProbeByHandle(vmaStackRecoveryProbeHandle).(selfLoadedProbe)
+		if ok && recordSelfLoadedProbe(selfLoadedPrograms, uniqueHooksMap, probe, kprobesOnly) {
+			log(probe.GetEventName(), probe.GetProgramName())
 		}
 	}
 

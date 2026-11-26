@@ -1,0 +1,18 @@
+apiVersion: tracee.aquasec.com/v1beta1
+kind: Policy
+metadata:
+  name: vma-lookup-test
+  annotations:
+    description: validate VMA lookup boundaries, simultaneous checks, and normal thread stacks
+spec:
+  scope:
+    - comm=vma_normal,vma_start,vma_end,vma_both
+  rules:
+    - event: VMA_LOOKUP
+    - event: getpid
+    - event: suspicious_syscall_source
+      filters:
+        - args.syscall=getpid
+    - event: stack_pivot
+      filters:
+        - args.syscall=getpid

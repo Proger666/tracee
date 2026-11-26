@@ -24,6 +24,7 @@ install_base_packages() {
         coreutils \
         findutils \
         git \
+        jq \
         curl \
         rsync \
         make \
