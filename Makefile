@@ -930,6 +930,14 @@ clean-traceectl::
 # unit tests
 #
 
+# Ordinary-memory fixtures: no kernel probes, BPF loading or syscall fixtures.
+.PHONY: test-vma-native
+test-vma-native::
+	sh scripts/vma_logic_test.sh
+	sh scripts/vma_stack_test.sh
+	sh scripts/vma_memory_test.sh
+	sh scripts/vma_checks_test.sh
+
 # Native VMA logic only: no kernel probes, BPF loading or syscall fixtures.
 .PHONY: benchmark-vma
 benchmark-vma:: \

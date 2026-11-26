@@ -103,9 +103,7 @@ jobs:
       - name: Test VMA values and event-result handling
         run: |
           set -euo pipefail
-          sh scripts/vma_logic_test.sh
-          sh scripts/vma_stack_test.sh
-          sh scripts/vma_memory_test.sh
+          make test-vma-native
           bash tests/e2e/test-vma-validation.sh
 
       - name: Test loader decisions and probe configuration

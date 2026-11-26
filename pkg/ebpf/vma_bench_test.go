@@ -69,3 +69,33 @@ func BenchmarkVMAJITSelection(b *testing.B) {
 		vmaBenchEnabled, vmaBenchError = vmaJITEnabled(false, read)
 	}
 }
+
+// This measures startup mask merging with a userspace map fake, including the
+// fixture reset and its byte-buffer copies. It does not measure BPF map syscalls
+// or syscall-event runtime overhead.
+func BenchmarkVMASyscallMaskMerge(b *testing.B) {
+	for _, tc := range []struct {
+		name     string
+		existing []byte
+	}{
+		{name: "new_selection"},
+		{name: "add_second_check", existing: vmaSelectionBytes(vmaCheckStack)},
+		{name: "already_selected", existing: vmaSelectionBytes(vmaCheckSource | vmaCheckStack)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			m := &vmaSelectionTestMap{values: make(map[uint32][]byte)}
+			b.ReportAllocs()
+			for b.Loop() {
+				if tc.existing == nil {
+					delete(m.values, 0)
+				} else {
+					m.values[0] = tc.existing
+				}
+				vmaBenchError = enableVMASyscallCheck(m, 0, vmaCheckSource)
+			}
+			if vmaBenchError != nil {
+				b.Fatal(vmaBenchError)
+			}
+		})
+	}
+}
